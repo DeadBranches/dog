@@ -122,6 +122,7 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Build dog (release)
+        shell: bash
         run: |
           set -euo pipefail
 
