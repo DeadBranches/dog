@@ -1,0 +1,230 @@
+name: Nightly Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.vars.outputs.skip }}
+      build_date: ${{ steps.vars.outputs.build_date }}
+      nightly_tag: ${{ steps.vars.outputs.nightly_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Compute nightly tag
+        id: vars
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          build_date="$(date -u +%m%d)"
+
+          version="$(python3 - <<'PY'
+          import pathlib, tomllib
+          data = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          print(data["package"]["version"])
+          PY
+          )"
+
+          sha_short="$(git rev-parse --short=6 HEAD)"
+
+          latest_tag="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq 'map(select(.tag_name | test("nightly")))|sort_by(.created_at)|reverse|.[0].tag_name // ""')"
+
+          if [ -n "${latest_tag}" ]; then
+            latest_hash="${latest_tag##*+}"
+            if [ "${latest_hash}" = "${sha_short}" ]; then
+              echo "skip=true" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+
+            build=1
+            prefix="${version}-nightly."
+            if [[ "${latest_tag}" == "${prefix}"* ]]; then
+              rest="${latest_tag#${prefix}}"
+              build_prev="${rest%%+*}"
+              if [[ "${build_prev}" =~ ^[0-9]+$ ]]; then
+                build=$((build_prev + 1))
+              fi
+            fi
+          else
+            build=1
+          fi
+
+          nightly_tag="${version}-nightly.${build}+${sha_short}"
+
+          echo "build_date=${build_date}" >> "${GITHUB_OUTPUT}"
+          echo "nightly_tag=${nightly_tag}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build dog
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 windows msvc
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            out_name: x86_64-windows-msvc
+            archive_ext: zip
+            exe: .exe
+            extra_features: ""
+            cross_toolchain: "false"
+
+          # x86_64 macos darwin
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            out_name: x86_64-macos-darwin
+            archive_ext: tar.gz
+            exe: ""
+            extra_features: ""
+            cross_toolchain: "false"
+
+          # aarch64 unknown linux musl
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04
+            out_name: aarch64-unknown-linux-musl
+            archive_ext: tar.gz
+            exe: ""
+            # helpful for musl builds that need OpenSSL (native-tls on linux)
+            extra_features: with_nativetls_vendored
+            cross_toolchain: "true"
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          rustflags: "" # don't force -D warnings
+
+      - name: Setup cross toolchain (Linux musl only)
+        if: matrix.cross_toolchain == 'true'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build dog (release)
+        run: |
+          set -euo pipefail
+
+          FEATURES="${{ matrix.extra_features }}"
+          if [ -n "${FEATURES}" ]; then
+            cargo build --release --bin dog --target "${{ matrix.target }}" --features "${FEATURES}"
+          else
+            cargo build --release --bin dog --target "${{ matrix.target }}"
+          fi
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+
+          BIN="target/${{ matrix.target }}/release/dog${{ matrix.exe }}"
+          ARCHIVE="dog-${{ needs.prepare.outputs.nightly_tag }}-${{ matrix.out_name }}.${{ matrix.archive_ext }}"
+
+          mkdir -p dist
+          tar -C "$(dirname "${BIN}")" -czf "dist/${ARCHIVE}" "$(basename "${BIN}")"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bin = "target/${{ matrix.target }}/release/dog${{ matrix.exe }}"
+          $archive = "dog-${{ needs.prepare.outputs.nightly_tag }}-${{ matrix.out_name }}.${{ matrix.archive_ext }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          7z a "dist/$archive" "$bin" | Out-Host
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dog-${{ matrix.out_name }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [prepare, build]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dog-*
+          merge-multiple: true
+
+      - name: Create checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum dog-* > SHA256SUMS
+
+      - name: Publish nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          tag_name: ${{ needs.prepare.outputs.nightly_tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.prepare.outputs.build_date }}-${{ needs.prepare.outputs.nightly_tag }}
+          files: |
+            dist/dog-*
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  cleanup:
+    name: Cleanup old nightlies
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.skip != 'true' && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete older nightly releases (keep last 10)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP_COUNT: "3"
+        run: |
+          set -euo pipefail
+
+          tags_to_delete="$(python3 - <<'PY'
+          import os, json, subprocess, re
+          KEEP = int(os.environ.get("KEEP_COUNT", "10"))
+          repo = os.environ["GITHUB_REPOSITORY"]
+          data = json.loads(subprocess.check_output(
+              ["gh", "api", f"repos/{repo}/releases", "--paginate"],
+              text=True,
+          ))
+          nightlies = [r for r in data if re.search(r"nightly", r.get("tag_name", ""))]
+          nightlies.sort(key=lambda r: r["created_at"], reverse=True)
+          for r in nightlies[KEEP:]:
+              print(r["tag_name"])
+          PY
+          )"
+
+          if [ -n "${tags_to_delete}" ]; then
+            while IFS= read -r tag; do
+              [ -n "$tag" ] || continue
+              echo "Deleting nightly release: $tag"
+              gh release delete "$tag" --yes --cleanup-tag
+            done <<< "${tags_to_delete}"
+          fi
